@@ -9,6 +9,9 @@ services:
       TRACE_DB_PATH: /data/trace.db
     volumes:
       - trace-data:/data
+    # 进程地址空间上限 256 MiB：纯追加路径的内存占用与历史扫描规模无关
+    mem_limit: 256m
+    memswap_limit: 256m
     restart: unless-stopped
 
 volumes:

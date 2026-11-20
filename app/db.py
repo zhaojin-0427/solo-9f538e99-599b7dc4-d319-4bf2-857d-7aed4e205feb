@@ -2,6 +2,11 @@
 
 持久化保证：扫描表与当前归属边表均在同一事务内写入，
 进程重启后直接从已提交状态恢复，不会出现混合修订或半截层级。
+
+内存约束（进程地址空间上限 256 MiB，库中可达 50 万+ 扫描）：
+* ``cache_size`` 限制 SQLite 页缓存，排序溢出走磁盘临时文件（``temp_store=FILE``）；
+* ``edges(parent)`` 与 ``scans(child)`` 建索引，子树/盒码查询只走索引点查，
+  任何提交路径都不需要把整表读入 Python。
 """
 
 from __future__ import annotations
@@ -13,7 +18,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 # 进程内写锁：SQLite 同一时刻只允许一个写事务，锁使并发提交串行化，
-# 配合每个事务内的“校验 + 重放 + 整体替换边表”，保证不会产生混合修订。
+# 配合每个事务内的“校验 + 增量写入”，保证不会产生混合修订。
 write_lock = threading.RLock()
 
 
@@ -29,6 +34,10 @@ def connect(path: str | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA synchronous=FULL")
+    # 页缓存上限约 16 MiB，大排序/哈希落磁盘临时文件，避免吃满进程地址空间。
+    conn.execute("PRAGMA cache_size=-16000")
+    conn.execute("PRAGMA temp_store=FILE")
+    conn.execute("PRAGMA mmap_size=0")
     return conn
 
 
@@ -46,6 +55,10 @@ CREATE TABLE IF NOT EXISTS edges (
     child  TEXT PRIMARY KEY,              -- 任一时点一个子项只能有一个父项
     parent TEXT NOT NULL
 );
+
+-- 子树展开（随箱移动的内盒）与父向点查的关键索引，旧库直接补建即可使用。
+CREATE INDEX IF NOT EXISTS edges_parent_idx ON edges(parent);
+CREATE INDEX IF NOT EXISTS scans_child_idx  ON scans(child);
 """
 
 

@@ -28,12 +28,29 @@
   原扫描与层级保持不变。
 * 补传/更正导致后续已存扫描变非法时，同样整批拒绝（重放覆盖全量历史）。
 
+## 两条提交路径与内存保证
+
+库中历史扫描可达 50 万笔以上，进程地址空间上限 256 MiB，提交按形态分流：
+
+* **纯追加快速路径**：批内扫描号均未用过、且序号均大于库中最大生效序号时
+  启用。只做索引点查（按子码查当前父项、按父码展开受影响子树），**不逐笔
+  读取旧扫描、不扫遍无关归属**；归属边表只 `upsert/delete` 真正变化的行。
+  追加一笔的内存占用与历史规模无关（50 万笔下实测峰值约 55 MiB、毫秒级）。
+* **通用重放路径**：补传、更正、重传，或追加与它们交错时启用。待合并扫描
+  写入连接级临时表，由 SQLite 按 `seq` 全序**流式**输出（排序溢出落磁盘
+  临时区），Python 侧每次只保留当前一行；新层级落在临时边表，最后只把
+  **有差异**的边同步到正式表，不做全表替换。
+* 两条路径都在**同一个 SQLite 事务**内校验与写入，失败整体回滚。
+
 ## 一致性保证
 
-* 校验、重放、扫描表 upsert、归属边表整体替换在**同一个 SQLite 事务**内完成，
+* 校验、写入扫描表、增量同步归属边表在**同一个 SQLite 事务**内完成，
   失败即回滚，不会只更新上层箱而漏掉内盒。
 * WAL 模式 + 进程内写锁串行化并发提交，读写并发下不会出现混合修订。
-* 数据落盘到 Docker 卷，重启后从已提交状态恢复。
+* 数据落盘到 Docker 卷，重启后从已提交状态恢复；旧版本 SQLite 库可直接
+  打开（启动时自动补建索引，表结构不变）。
+* 回执 `replayed_scans` 为提交后**生效扫描总数**；`changes` 只列提交前后
+  完整路径不同的盒码，含旧/新托盘与完整路径，随外箱移动的内盒一并列出。
 
 ## 快速开始（Docker Compose）
 
@@ -52,7 +69,8 @@ docker compose up --build
 pip install -r requirements.txt
 pip install pytest httpx
 TRACE_DB_PATH=./data/trace.db uvicorn app.main:app --reload
-pytest          # 17 个端到端测试
+pytest          # 端到端测试（含增量写入、交错批次、回滚、并发与重启恢复）
+TRACE_RUN_SCALE=1 pytest tests/test_scale_incremental.py   # 启用规模化内存测试
 ```
 
 ## 接口
@@ -124,10 +142,10 @@ curl http://localhost:8000/boxes/B:box01
 ```
 app/
   main.py      FastAPI 路由与异常映射
-  service.py   修订合并、按序号重放、环/角色/双归属校验、路径计算
-  db.py        SQLite 连接、WAL、写锁、建表
+  service.py   纯追加快速路径、流式重放、环/角色/双归属校验、增量回执
+  db.py        SQLite 连接、WAL、写锁、建表与内存相关 PRAGMA
   schemas.py   Pydantic 请求/响应模型
-tests/         端到端测试（含并发、重启恢复、整批回滚）
+tests/         端到端测试（含并发、重启恢复、整批回滚、增量写入与规模化）
 Dockerfile
-docker-compose.yml
+docker-compose.yml   含 256 MiB 地址空间上限（mem_limit）
 ```
